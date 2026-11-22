@@ -1,0 +1,217 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  ANDROID_HOME: /usr/local/lib/android/sdk
+  ANDROID_NDK_VERSION: 29.0.14206865
+  NDK_VERSION: 29.0.14206865
+  RUST_BACKTRACE: 1
+
+jobs:
+  apk:
+    name: Build signed release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare build notes
+        run: mkdir -p .ci && echo "workspace ready" > .ci/steps.log
+
+      - name: Set up JDK
+        id: java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        id: sdk_setup
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ""
+
+      - name: Install Android SDK packages
+        id: sdk_packages
+        run: |
+          set -o pipefail
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;36.0.0" \
+            "ndk;${ANDROID_NDK_VERSION}" 2>&1 | tee -a .ci/steps.log
+
+      - name: Set up Rust
+        id: rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Cache Rust artifacts
+        id: cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-apk
+          cache-on-failure: true
+
+      - name: Install cargo-apk
+        id: cargo_apk
+        run: |
+          set -o pipefail
+          cargo install --git https://github.com/parasyte/cargo-apk.git \
+            --rev 282639508eeed7d73f2e1eaeea042da2716436d5 \
+            cargo-apk 2>&1 | tee -a .ci/steps.log
+
+      - name: Build APK
+        id: build
+        env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+          RELEASE_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          CARGO_APK_RELEASE_KEYSTORE: ${{ runner.temp }}/release.jks
+          CARGO_APK_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -o pipefail
+          if [ -z "$RELEASE_KEYSTORE_B64" ] || [ -z "$CARGO_APK_RELEASE_KEYSTORE_PASSWORD" ]; then
+            echo "Missing ANDROID_KEYSTORE_BASE64 or ANDROID_KEYSTORE_PASSWORD secrets" >&2
+            exit 1
+          fi
+          printf '%s' "$RELEASE_KEYSTORE_B64" | base64 --decode > "$CARGO_APK_RELEASE_KEYSTORE"
+          cargo apk build --lib --release 2>&1 | tee -a .ci/steps.log
+
+      - name: Build debug APK
+        id: build_debug
+        env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+        run: |
+          set -o pipefail
+          cargo apk build --lib 2>&1 | tee -a .ci/steps.log
+
+      - name: Collect APK
+        id: collect
+        run: |
+          APK=$(find target/release -type f -name '*.apk' ! -name '*unaligned*' -print -quit)
+          if [ -z "$APK" ]; then
+            echo "No release APK was produced" >&2
+            find target -maxdepth 5 -name '*.apk' >&2 || true
+            exit 1
+          fi
+          echo "Built $APK"
+          cp "$APK" AioTrack.apk
+          DEBUG_APK=$(find target/debug -type f -name '*.apk' ! -name '*unaligned*' -print -quit)
+          if [ -z "$DEBUG_APK" ]; then
+            echo "No debug APK was produced" >&2
+            exit 1
+          fi
+          echo "Built $DEBUG_APK"
+          cp "$DEBUG_APK" AioTrack-debug.apk
+          ls -lh AioTrack.apk AioTrack-debug.apk
+
+      - name: Verify APK signature
+        id: verify
+        run: |
+          BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/36.0.0"
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs AioTrack.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs AioTrack-debug.apk
+          "$BUILD_TOOLS/aapt2" dump badging AioTrack.apk | head -n 12
+
+      - name: Upload artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: AioTrack-${{ github.run_number }}
+          path: |
+            AioTrack.apk
+            AioTrack-debug.apk
+          if-no-files-found: error
+
+      - name: Publish latest release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-latest
+          name: AioTrack — latest Android build
+          body: |
+            Signed release and debug APKs built from `${{ github.sha }}` by GitHub Actions.
+
+            **Install:** download `AioTrack.apk` (release, signed with the stable key) or
+            `AioTrack-debug.apk` (debug build) and open it on your Android phone. You may need
+            to allow installing from this source. Requires Android 8.0 or newer.
+
+            **Updates:** every push to `main` refreshes this release, so this link always
+            points at the newest build. The signing key never changes, so updates install
+            over the previous version.
+          files: |
+            AioTrack.apk
+            AioTrack-debug.apk
+          overwrite_files: true
+          make_latest: true
+          fail_on_unmatched_files: true
+
+      - name: Record build status
+        if: always()
+        continue-on-error: true
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ ! -d .git ]; then
+            exit 0
+          fi
+          mkdir -p .ci
+          {
+            echo "sha: $GITHUB_SHA"
+            echo "status: $JOB_STATUS"
+            echo "run: $GITHUB_RUN_ID"
+            echo "time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > .ci/status.txt
+          {
+            echo "checkout: ${{ steps.checkout.outcome }}"
+            echo "java: ${{ steps.java.outcome }}"
+            echo "sdk_setup: ${{ steps.sdk_setup.outcome }}"
+            echo "sdk_packages: ${{ steps.sdk_packages.outcome }}"
+            echo "rust: ${{ steps.rust.outcome }}"
+            echo "cache: ${{ steps.cache.outcome }}"
+            echo "cargo_apk: ${{ steps.cargo_apk.outcome }}"
+            echo "build: ${{ steps.build.outcome }}"
+            echo "build_debug: ${{ steps.build_debug.outcome }}"
+            echo "collect: ${{ steps.collect.outcome }}"
+            echo "verify: ${{ steps.verify.outcome }}"
+            echo "upload: ${{ steps.upload.outcome }}"
+            echo "release: ${{ steps.release.outcome }}"
+          } >> .ci/status.txt
+          if [ -f AioTrack.apk ]; then
+            echo "apk_bytes: $(stat -c%s AioTrack.apk)" >> .ci/status.txt
+            sha256sum AioTrack.apk >> .ci/status.txt
+          fi
+          if [ -f AioTrack-debug.apk ]; then
+            echo "debug_apk_bytes: $(stat -c%s AioTrack-debug.apk)" >> .ci/status.txt
+            sha256sum AioTrack-debug.apk >> .ci/status.txt
+          fi
+          if [ -f .ci/steps.log ]; then
+            tail -n 400 .ci/steps.log > .ci/tail.log
+            rm .ci/steps.log
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B ci-status
+          git add -f .ci
+          git commit -m "CI status: $JOB_STATUS $GITHUB_SHA" || true
+          git push -f origin ci-status
