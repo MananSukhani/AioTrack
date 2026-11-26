@@ -1,0 +1,45 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Android / APK output
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+/local.properties
+/.gradle/
+/android/.gradle/
+/android/build/
+/android/captures/
+
+# Local app state and generated logs
+state.json
+*.json.tmp
+*.log
+/.ci/
+
+# Secrets and signing material (never commit these)
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.key
+*.jks
+*.keystore
+/android/keystore/*
+!/android/keystore/README.md
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors and OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
